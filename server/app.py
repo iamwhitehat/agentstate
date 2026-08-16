@@ -28,12 +28,13 @@ CREATE TABLE IF NOT EXISTS leases (
 CREATE TABLE IF NOT EXISTS events (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,
     work_ref   TEXT NOT NULL,
+    lease      TEXT,
     step       TEXT NOT NULL,
     planned    TEXT,
     executed   TEXT,
     gate       TEXT,
     at         REAL NOT NULL,
-    UNIQUE(work_ref, step)
+    UNIQUE(work_ref, lease, step)
 );
 CREATE INDEX IF NOT EXISTS idx_events_work ON events(work_ref);
 """
@@ -52,9 +53,9 @@ def reap(conn, work_ref):
     if row and row["status"] == "active" and row["lease_until"] < now:
         conn.execute("UPDATE leases SET status='abandoned' WHERE work_ref=?", (work_ref,))
         conn.execute(
-            "INSERT OR IGNORE INTO events(work_ref, step, planned, executed, gate, at) "
-            "VALUES(?, 'lease-expired', 'complete', 'abandoned', 'reaper', ?)",
-            (work_ref, now),
+            "INSERT OR IGNORE INTO events(work_ref, lease, step, planned, executed, gate, at) "
+            "VALUES(?, ?, 'lease-expired', 'complete', 'abandoned', 'reaper', ?)",
+            (work_ref, row["lease_id"], now),
         )
 
 
@@ -148,9 +149,9 @@ class Handler(BaseHTTPRequestHandler):
             raise ValueError("unknown lease")
         conn.execute("UPDATE leases SET status='done' WHERE work_ref=?", (work_ref,))
         conn.execute(
-            "INSERT OR IGNORE INTO events(work_ref, step, planned, executed, gate, at) "
-            "VALUES(?, 'complete', 'run', ?, 'agent', ?)",
-            (work_ref, body.get("result", "ok"), time.time()),
+            "INSERT OR IGNORE INTO events(work_ref, lease, step, planned, executed, gate, at) "
+            "VALUES(?, ?, 'complete', 'run', ?, 'agent', ?)",
+            (work_ref, lease, body.get("result", "ok"), time.time()),
         )
         self._json(200, {"work_ref": work_ref, "status": "done"})
 
@@ -159,9 +160,9 @@ class Handler(BaseHTTPRequestHandler):
         if not work_ref or not step:
             raise ValueError("work_ref and step required")
         conn.execute(
-            "INSERT OR IGNORE INTO events(work_ref, step, planned, executed, gate, at) "
-            "VALUES(?, ?, ?, ?, ?, ?)",
-            (work_ref, step, body.get("planned"), body.get("executed"),
+            "INSERT OR IGNORE INTO events(work_ref, lease, step, planned, executed, gate, at) "
+            "VALUES(?, ?, ?, ?, ?, ?, ?)",
+            (work_ref, body.get("lease"), step, body.get("planned"), body.get("executed"),
              body.get("gate", "agent"), time.time()),
         )
         self._json(200, {"logged": step})
