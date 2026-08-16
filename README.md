@@ -27,9 +27,11 @@ All JSON. Base: `http://127.0.0.1:8787`
 |---|---|---|
 | `POST /lease` | `{"work_ref":"job-42","ttl":300}` | Acquire the job with a 5-min lease. Idempotent: returns the existing active lease for that job. |
 | `POST /heartbeat` | `{"work_ref":"job-42","lease":"…"}` | Extend the lease by its TTL. Returns 409 if expired. |
-| `POST /complete` | `{"work_ref":"job-42","lease":"…","result":"ok"}` | Close the job safely, log a `complete` event. |
-| `POST /event` | `{"work_ref":"job-42","step":"quote","planned":"x","executed":"y","gate":"agent"}` | Append to ledger. Idempotent per `(work_ref, step)`. |
+| `POST /complete` | `{"work_ref":"job-42","lease":"","result":"ok"}` | Close the job safely, log a `complete` event. Response includes the manifest diff. |
+| `POST /manifest` | `{"work_ref":"job-42","lease":"…","steps":["a","b","c"]}` | Commit the plan BEFORE starting. Enables omission detection. |
+| `POST /event` | `{"work_ref":"job-42","step":"quote","planned":"x","executed":"y","gate":"agent"}` | Append to ledger. Idempotent per `(work_ref, lease, step)`. |
 | `GET /ledger?work=job-42` | — | Full planned-vs-executed history with resolution gate. |
+| `GET /ledger?work=job-42&diff=1` | — | Same, plus the **manifest diff**: `holes` (planned steps never logged) and `extras` (logged steps not planned). |
 
 Reaper: any expired lease flips to `abandoned` on next interaction with that job — the work is instantly observable as unowned and can be safely re-claimed.
 

@@ -81,6 +81,19 @@ def reap(conn, work_ref):
         append_event(conn, work_ref, row["lease_id"], "lease-expired", "complete", "abandoned", "reaper", now)
 
 
+def build_diff(conn, work_ref):
+    """Planned vs executed over the committed manifest: holes = steps that RAN but were never logged become gaps."""
+    rows = conn.execute(
+        "SELECT step, executed FROM events WHERE work_ref=? ORDER BY id", (work_ref,)
+    ).fetchall()
+    manifests = [json.loads(r["executed"]) for r in rows if r["step"] == "manifest" and r["executed"]]
+    executed = {r["step"] for r in rows if r["step"] not in ("manifest", "lease-expired", "complete")}
+    plan = manifests[-1] if manifests else []
+    holes = [s for s in plan if s not in executed]
+    extras = [s for s in sorted(executed) if s not in plan]
+    return {"has_manifest": bool(manifests), "planned": plan, "holes": holes, "extras": extras}
+
+
 class Handler(BaseHTTPRequestHandler):
     def _json(self, code, obj):
         body = json.dumps(obj).encode()
@@ -104,6 +117,7 @@ class Handler(BaseHTTPRequestHandler):
         if not work:
             self._json(400, {"error": "work required"})
             return
+        want_diff = "diff" in q
         with LOCK, db() as conn:
             rows = conn.execute(
                 "SELECT id, lease, step, planned, executed, gate, at, prev_hash, entry_hash FROM events "
@@ -126,6 +140,7 @@ class Handler(BaseHTTPRequestHandler):
                 "work_ref": work,
                 "integrity": "ok" if broken is None else "broken",
                 "first_broken_event_id": broken,
+                "diff": build_diff(conn, work) if want_diff else None,
                 "events": events,
             })
 
@@ -142,6 +157,8 @@ class Handler(BaseHTTPRequestHandler):
                     self._complete(conn, body)
                 elif path == "/event":
                     self._event(conn, body)
+                elif path == "/manifest":
+                    self._manifest(conn, body)
                 else:
                     self._json(404, {"error": "not found"})
         except Exception as e:
@@ -189,7 +206,19 @@ class Handler(BaseHTTPRequestHandler):
             raise ValueError("unknown lease")
         conn.execute("UPDATE leases SET status='done' WHERE work_ref=?", (work_ref,))
         append_event(conn, work_ref, lease, "complete", "run", body.get("result", "ok"), "agent")
-        self._json(200, {"work_ref": work_ref, "status": "done"})
+        self._json(200, {"work_ref": work_ref, "status": "done", "diff": build_diff(conn, work_ref)})
+
+    def _manifest(self, conn, body):
+        work_ref, lease = body.get("work_ref"), body.get("lease")
+        steps = body.get("steps")
+        if not work_ref or not lease or not isinstance(steps, list) or not steps:
+            raise ValueError("work_ref, lease and non-empty steps required")
+        row = conn.execute("SELECT * FROM leases WHERE work_ref=?", (work_ref,)).fetchone()
+        if not row or row["lease_id"] != lease or row["status"] != "active":
+            raise ValueError("active lease required")
+        append_event(conn, work_ref, lease, "manifest", "commit",
+                     json.dumps(steps, ensure_ascii=False), "agent")
+        self._json(200, {"committed": len(steps), "steps": steps})
 
     def _event(self, conn, body):
         work_ref, step = body.get("work_ref"), body.get("step")
