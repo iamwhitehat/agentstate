@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
-"""AgentState server - leases, idempotency, recovery reaper, append-only ledger.
+"""AgentState server - leases, idempotency, recovery reaper, hash-chained append-only ledger.
 
-Zero dependencies: Python 3.8+ stdlib only.
+v0.2.0 - ledger entries are hash-chained (sha256 over prev hash + full entry), so
+tampering is detectable. Zero dependencies: Python 3.8+ stdlib only.
 Run:  python3 server/app.py   (listens on 127.0.0.1:8787)
 """
+import hashlib
 import json
 import sqlite3
 import threading
@@ -15,6 +17,7 @@ from urllib.parse import urlparse, parse_qs
 DB_PATH = "agentstate.db"
 HOST, PORT = "127.0.0.1", 8787
 LOCK = threading.Lock()
+GENESIS = "GENESIS"
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS leases (
@@ -34,6 +37,8 @@ CREATE TABLE IF NOT EXISTS events (
     executed   TEXT,
     gate       TEXT,
     at         REAL NOT NULL,
+    prev_hash  TEXT NOT NULL,
+    entry_hash TEXT NOT NULL,
     UNIQUE(work_ref, lease, step)
 );
 CREATE INDEX IF NOT EXISTS idx_events_work ON events(work_ref);
@@ -46,17 +51,34 @@ def db():
     return conn
 
 
+def entry_hash(prev, work_ref, lease, step, planned, executed, gate, at):
+    payload = "|".join([str(x) for x in (prev, work_ref, lease, step, planned, executed, gate, at)])
+    return hashlib.sha256(payload.encode()).hexdigest()
+
+
+def append_event(conn, work_ref, lease, step, planned, executed, gate, at=None):
+    """Insert one ledger entry, chained to the previous entry of the same work_ref."""
+    at = at if at is not None else time.time()
+    prev = conn.execute(
+        "SELECT entry_hash FROM events WHERE work_ref=? ORDER BY id DESC LIMIT 1",
+        (work_ref,),
+    ).fetchone()
+    prev_hash = prev["entry_hash"] if prev else GENESIS
+    ehash = entry_hash(prev_hash, work_ref, lease, step, planned, executed, gate, at)
+    conn.execute(
+        "INSERT OR IGNORE INTO events(work_ref, lease, step, planned, executed, gate, at, prev_hash, entry_hash) "
+        "VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (work_ref, lease, step, planned, executed, gate, at, prev_hash, ehash),
+    )
+
+
 def reap(conn, work_ref):
     """Expire stale leases; each abandonment is itself a ledger event."""
     now = time.time()
     row = conn.execute("SELECT * FROM leases WHERE work_ref=?", (work_ref,)).fetchone()
     if row and row["status"] == "active" and row["lease_until"] < now:
         conn.execute("UPDATE leases SET status='abandoned' WHERE work_ref=?", (work_ref,))
-        conn.execute(
-            "INSERT OR IGNORE INTO events(work_ref, lease, step, planned, executed, gate, at) "
-            "VALUES(?, ?, 'lease-expired', 'complete', 'abandoned', 'reaper', ?)",
-            (work_ref, row["lease_id"], now),
-        )
+        append_event(conn, work_ref, row["lease_id"], "lease-expired", "complete", "abandoned", "reaper", now)
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -84,10 +106,28 @@ class Handler(BaseHTTPRequestHandler):
             return
         with LOCK, db() as conn:
             rows = conn.execute(
-                "SELECT step, planned, executed, gate, at FROM events "
+                "SELECT id, lease, step, planned, executed, gate, at, prev_hash, entry_hash FROM events "
                 "WHERE work_ref=? ORDER BY id", (work,)
             ).fetchall()
-            self._json(200, {"work_ref": work, "events": [dict(r) for r in rows]})
+            events, broken = [], None
+            expect = GENESIS
+            for r in rows:
+                recomputed = entry_hash(expect, work, r["lease"],
+                                        r["step"], r["planned"], r["executed"], r["gate"], r["at"])
+                ok = (recomputed == r["entry_hash"]) and (r["prev_hash"] == expect)
+                if not ok:
+                    broken = broken if broken is not None else r["id"]
+                expect = r["entry_hash"]
+                events.append({
+                    "step": r["step"], "planned": r["planned"], "executed": r["executed"],
+                    "gate": r["gate"], "at": r["at"], "prev_hash": r["prev_hash"], "entry_hash": r["entry_hash"],
+                })
+            self._json(200, {
+                "work_ref": work,
+                "integrity": "ok" if broken is None else "broken",
+                "first_broken_event_id": broken,
+                "events": events,
+            })
 
     def do_POST(self):
         path = urlparse(self.path).path
@@ -148,28 +188,20 @@ class Handler(BaseHTTPRequestHandler):
         if not row or row["lease_id"] != lease:
             raise ValueError("unknown lease")
         conn.execute("UPDATE leases SET status='done' WHERE work_ref=?", (work_ref,))
-        conn.execute(
-            "INSERT OR IGNORE INTO events(work_ref, lease, step, planned, executed, gate, at) "
-            "VALUES(?, ?, 'complete', 'run', ?, 'agent', ?)",
-            (work_ref, lease, body.get("result", "ok"), time.time()),
-        )
+        append_event(conn, work_ref, lease, "complete", "run", body.get("result", "ok"), "agent")
         self._json(200, {"work_ref": work_ref, "status": "done"})
 
     def _event(self, conn, body):
         work_ref, step = body.get("work_ref"), body.get("step")
         if not work_ref or not step:
             raise ValueError("work_ref and step required")
-        conn.execute(
-            "INSERT OR IGNORE INTO events(work_ref, lease, step, planned, executed, gate, at) "
-            "VALUES(?, ?, ?, ?, ?, ?, ?)",
-            (work_ref, body.get("lease"), step, body.get("planned"), body.get("executed"),
-             body.get("gate", "agent"), time.time()),
-        )
+        append_event(conn, work_ref, body.get("lease"), step, body.get("planned"),
+                     body.get("executed"), body.get("gate", "agent"), time.time())
         self._json(200, {"logged": step})
 
 
 if __name__ == "__main__":
     with LOCK, db() as conn:
         conn.executescript(SCHEMA)
-    print(f"AgentState listening on http://{HOST}:{PORT}")
+    print(f"AgentState v0.2.0 listening on http://{HOST}:{PORT}")
     ThreadingHTTPServer((HOST, PORT), Handler).serve_forever()

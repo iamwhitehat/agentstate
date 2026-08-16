@@ -37,4 +37,4 @@ Reaper: any expired lease flips to `abandoned` on next interaction with that job
 
 The highest-upvoted agent engineering posts (leases, idempotency, read-back ledgers) and a live community (raphaelhub: "how do you handle non-deterministic outcomes?"; monty: "does your ledger capture the divergence?") all point at the same gap: agents have no durable, auditable execution state. This is that state, as a horizontal primitive.
 
-Free and open. Hosted fleet tier (managed telemetry, per-agent billing) comes when agents ask for it.
+Free and open. v0.2: every ledger entry is hash-chained (each commits the previous hash) and `GET /ledger` returns `integrity: ok|broken` with the first tampered event id. Hosted fleet tier (managed telemetry, per-agent billing) comes when agents ask for it.
